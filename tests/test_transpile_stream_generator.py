@@ -2,8 +2,11 @@
 
 import json
 
+import pytest
+
 from gemma4_delimiter_proxy import proxy
 from gemma4_delimiter_proxy.proxy import transpile_stream_generator
+from tests.fakes import FakeAsyncClient, FakeUpstreamResponse, SimpleRequest
 
 
 class FakeAsyncResponse:
@@ -113,72 +116,65 @@ async def test_done_is_forwarded():
     assert out[-1] == b"data: [DONE]\n\n"
 
 
-class FakeUpstreamResponse:
-    """httpx.Response stand-in: yields SSE chunks and records aclose() calls."""
-
-    def __init__(self, chunks: list[bytes]):
-        self._chunks = chunks
-        self.aclose_called = 0
-
-    async def aiter_bytes(self):
-        for chunk in self._chunks:
-            yield chunk
-
-    async def aclose(self):
-        self.aclose_called += 1
-
-
-class FakeAsyncClient:
-    """httpx.AsyncClient stand-in: records aclose() calls."""
-
-    def __init__(self, upstream_response: FakeUpstreamResponse, timeout=None):
-        self.upstream_response = upstream_response
-        self.aclose_called = 0
-
-    def build_request(self, method, url, json=None, headers=None):
-        return object()
-
-    async def send(self, request, stream=False):
-        return self.upstream_response
-
-    async def post(self, url, json=None, headers=None):
-        return self.upstream_response
-
-    async def aclose(self):
-        self.aclose_called += 1
-
-
-class SimpleRequest:
-    """Minimal FastAPI Request stand-in: json() + headers."""
-
-    def __init__(self, body: dict):
-        self._body = body
-        self.headers = {}
-
-    async def json(self):
-        return self._body
-
-
 async def test_stream_closes_response_and_client(monkeypatch):
-    upstream = FakeUpstreamResponse([_sse("hi"), b"data: [DONE]\n\n"])
+    upstream = FakeUpstreamResponse(b"data: {\"choices\": []}\n\n")
     fake_client = FakeAsyncClient(upstream)
     monkeypatch.setattr(proxy.httpx, "AsyncClient", lambda **kwargs: fake_client)
 
-    response = await proxy.chat_completions_proxy(SimpleRequest({"stream": True}))
+    body = json.dumps({"stream": True}).encode()
+    response = await proxy.chat_completions_proxy(SimpleRequest(body=body))
     chunks = [chunk async for chunk in response.body_iterator]
-    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert len(chunks) == 1
+    assert upstream.aclose_called == 1
+    assert fake_client.aclose_called == 1
+    # Forwarded to the upstream base URL + verbatim path
+    method, url, content, _headers = fake_client.sent[0]
+    assert method == "POST"
+    assert url == proxy.UPSTREAM_URL + "/v1/chat/completions"
+    assert content == body
+
+
+async def test_non_stream_closes_client(monkeypatch):
+    upstream = FakeUpstreamResponse(b'{"choices": []}')
+    fake_client = FakeAsyncClient(upstream)
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", lambda **kwargs: fake_client)
+
+    body = json.dumps({"stream": False}).encode()
+    response = await proxy.chat_completions_proxy(SimpleRequest(body=body))
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"choices": []}
     assert upstream.aclose_called == 1
     assert fake_client.aclose_called == 1
 
 
-async def test_non_stream_closes_client(monkeypatch):
-    upstream = FakeUpstreamResponse([])
-    upstream.json = lambda: {"choices": []}
+async def test_non_stream_upstream_status_forwarded(monkeypatch):
+    upstream = FakeUpstreamResponse(
+        b'{"error": "model not found"}', status_code=404,
+        headers={"content-type": "application/json"},
+    )
     fake_client = FakeAsyncClient(upstream)
     monkeypatch.setattr(proxy.httpx, "AsyncClient", lambda **kwargs: fake_client)
 
-    result = await proxy.chat_completions_proxy(SimpleRequest({"stream": False}))
-    assert result == {"choices": []}
+    body = json.dumps({"stream": False}).encode()
+    response = await proxy.chat_completions_proxy(SimpleRequest(body=body))
+    assert response.status_code == 404
+    assert json.loads(response.body) == {"error": "model not found"}
+    assert upstream.aclose_called == 1
+    assert fake_client.aclose_called == 1
+
+
+async def test_non_stream_post_failure_closes_client_and_propagates(monkeypatch):
+    class FailingClient(FakeAsyncClient):
+        async def post(self, url, content=None, headers=None, json=None):
+            raise ConnectionError("upstream down")
+
+    upstream = FakeUpstreamResponse(b"")
+    fake_client = FailingClient(upstream)
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", lambda **kwargs: fake_client)
+
+    body = json.dumps({"stream": False}).encode()
+    with pytest.raises(ConnectionError, match="upstream down"):
+        await proxy.chat_completions_proxy(SimpleRequest(body=body))
     assert fake_client.aclose_called == 1
 
 
