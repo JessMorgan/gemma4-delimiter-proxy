@@ -34,11 +34,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # GHCR image names must be lowercase; github.repository may contain
-          # uppercase letters (e.g. JessMorgan/...), so apply the |lower transformer
-          images: ghcr.io/${{ github.repository }}|lower
+          # GHCR image names must be lowercase; the action lowercases
+          # github.repository (e.g. JessMorgan/...) automatically
+          images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable={{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
 
       - name: Build and push
