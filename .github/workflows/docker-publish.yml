@@ -38,7 +38,8 @@ jobs:
           # github.repository (e.g. JessMorgan/...) automatically
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            # main push -> latest; vX.Y.Z tag push -> vX.Y.Z (+ latest via latest=auto)
+            type=raw,value=latest
             type=ref,event=tag
 
       - name: Build and push
