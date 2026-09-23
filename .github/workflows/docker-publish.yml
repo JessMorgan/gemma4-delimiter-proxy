@@ -1,0 +1,52 @@
+name: Docker publish
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # GHCR image names must be lowercase; github.repository may contain
+          # uppercase letters (e.g. JessMorgan/...), so apply the |lower transformer
+          images: ghcr.io/${{ github.repository }}|lower
+          tags: |
+            type=raw,value=latest,enable={{ github.ref == 'refs/heads/main' }}
+            type=refs
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          context: .
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
