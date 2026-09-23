@@ -80,6 +80,31 @@ upstream, so the healthcheck reflects **upstream availability** as well: if
 the upstream is down, the container is reported unhealthy even though the
 proxy itself is running.
 
+### Docker image
+
+A prebuilt image is published to GitHub Container Registry on every push to
+`main` and on release tags:
+
+```
+ghcr.io/jessmorgan/gemma4-delimiter-proxy
+```
+
+Tag scheme:
+
+- `latest` — built from the latest `main` commit
+- `main` — same image as `latest` (emitted by `type=refs` on branch pushes)
+- `vX.Y.Z` — built from the matching `vX.Y.Z` git tag
+
+Pull and run:
+
+```bash
+docker pull ghcr.io/jessmorgan/gemma4-delimiter-proxy:latest
+docker run --rm -p 4001:4001 \
+  -e GEMMA_UPSTREAM_URL=http://host.docker.internal:8000 \
+  --add-host host.docker.internal:host-gateway \
+  ghcr.io/jessmorgan/gemma4-delimiter-proxy:latest
+```
+
 ## Development
 
 ```bash
