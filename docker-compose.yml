@@ -1,0 +1,15 @@
+services:
+  gemma4-delimiter-proxy:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "4001:4001"
+    environment:
+      # Upstream vLLM/SGLang base URL.
+      # On macOS/Windows, host.docker.internal resolves to the host machine.
+      # On Linux, host.docker.internal is not defined by default; the
+      # extra_hosts entry below maps it to the Docker bridge gateway, or set
+      # this to the host's LAN IP (e.g. http://192.168.1.50:8000).
+      GEMMA_UPSTREAM_URL: "http://host.docker.internal:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -32,19 +32,53 @@ uv sync
 uv run gemma4-delimiter-proxy
 ```
 
-The proxy listens on `0.0.0.0:4001`.
+The proxy listens on `0.0.0.0:4001` by default; bind address, port, and log
+level are configurable via environment variables (see [Configuration](#configuration)).
 
 ## Configuration
 
 | Env var | Default | Description |
 |---|---|---|
 | `GEMMA_UPSTREAM_URL` | `http://localhost:8000` | Upstream **base URL**; the request path + query string are appended verbatim (e.g. `/v1/models?limit=5` → `http://localhost:8000/v1/models?limit=5`) |
+| `GEMMA_PROXY_HOST` | `0.0.0.0` | Address the proxy binds to |
+| `GEMMA_PROXY_PORT` | `4001` | Port the proxy listens on (must be an integer) |
+| `GEMMA_PROXY_LOG_LEVEL` | `info` | Uvicorn log level (`debug`, `info`, `warning`, `error`, ...) |
 
 Example:
 
 ```bash
-GEMMA_UPSTREAM_URL=http://gpu-host:8000 uv run gemma4-delimiter-proxy
+GEMMA_UPSTREAM_URL=http://gpu-host:8000 GEMMA_PROXY_PORT=8080 uv run gemma4-delimiter-proxy
 ```
+
+## Running with Docker
+
+Build and run the image directly:
+
+```bash
+docker build -t gemma4-delimiter-proxy .
+docker run --rm -p 4001:4001 \
+  -e GEMMA_UPSTREAM_URL=http://host.docker.internal:8000 \
+  --add-host host.docker.internal:host-gateway \
+  gemma4-delimiter-proxy
+```
+
+Or use the provided compose file:
+
+```bash
+docker compose up --build
+```
+
+The compose service maps `4001:4001` and sets `GEMMA_UPSTREAM_URL` to
+`http://host.docker.internal:8000` by default, with
+`host.docker.internal:host-gateway` mapped so it works on Linux as well as
+macOS/Windows. On Linux without the `host-gateway` mapping, point
+`GEMMA_UPSTREAM_URL` at the host's LAN IP (e.g. `http://192.168.1.50:8000`).
+
+The image runs as a non-root user, exposes port `4001`, and includes a
+`HEALTHCHECK` that hits `/healthz`. Note that `/healthz` is proxied to the
+upstream, so the healthcheck reflects **upstream availability** as well: if
+the upstream is down, the container is reported unhealthy even though the
+proxy itself is running.
 
 ## Development
 
