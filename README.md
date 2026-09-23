@@ -91,8 +91,7 @@ ghcr.io/jessmorgan/gemma4-delimiter-proxy
 
 Tag scheme:
 
-- `latest` — built from the latest `main` commit
-- `main` — same image as `latest` (emitted by `type=refs` on branch pushes)
+- `latest` — built from the latest `main` commit (also updated by release tags)
 - `vX.Y.Z` — built from the matching `vX.Y.Z` git tag
 
 Pull and run:
