@@ -1,5 +1,9 @@
-"""FastAPI SSE proxy that transpiles Gemma 4 channel/tool-call delimiters
-into OpenAI chat-completion format."""
+"""Full OpenAI-compatible API proxy for Gemma 4 upstreams.
+
+Proxies every request path (any method) to the upstream vLLM/SGLang server,
+applying Gemma 4 channel/tool-call delimiter transpilation ONLY to streaming
+`POST /v1/chat/completions` responses.
+"""
 
 import json
 import os
@@ -8,13 +12,28 @@ import uuid
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 app = FastAPI()
-# Update this to your upstream vLLM or SGLang server endpoint
-UPSTREAM_URL = os.environ.get(
-    "GEMMA_UPSTREAM_URL", "http://localhost:8000/v1/chat/completions"
+# Upstream base URL; the request path + query string are forwarded verbatim
+UPSTREAM_URL = os.environ.get("GEMMA_UPSTREAM_URL", "http://localhost:8000").rstrip("/")
+
+# Hop-by-hop headers that must not be forwarded (RFC 7230 section 6.1)
+HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "host",
+        "connection",
+        "content-length",
+        "transfer-encoding",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "upgrade",
+    }
 )
+
+# Generous read timeout for model endpoints; connect stays short
+TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
 # Streaming channel state definitions
 STATE_CONTENT = "content"
@@ -191,35 +210,121 @@ async def transpile_stream_generator(upstream_response):
                 yield f"{line}\n\n".encode()
 
 
+def _upstream_url(request: Request) -> str:
+    """Full upstream URL: base URL + verbatim path + query string."""
+    path = request.url.path
+    query = request.url.query
+    return f"{UPSTREAM_URL}{path}{'?' + query if query else ''}"
+
+
+def _forward_headers(request: Request) -> dict[str, str]:
+    """Request headers minus the hop-by-hop set."""
+    return {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+
+
+def _response_headers(upstream_response) -> dict[str, str]:
+    """Upstream response headers minus the hop-by-hop set."""
+    return {
+        key: value
+        for key, value in upstream_response.headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS
+    }
+
+
+def _streaming_response(upstream_response, client, generator, headers: dict[str, str]) -> StreamingResponse:
+    """Wrap a byte generator so the upstream response and client are closed
+    once the stream is fully consumed, cancelled, or the client disconnects.
+
+    Upstream response headers (hop-by-hop stripped) are passed through as-is,
+    preserving the exact content-type (incl. any parameters).
+    """
+
+    async def stream_with_cleanup():
+        try:
+            async for chunk in generator:
+                yield chunk
+        finally:
+            await upstream_response.aclose()
+            await client.aclose()
+
+    return StreamingResponse(stream_with_cleanup(), headers=headers)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions_proxy(request: Request):
-    body = await request.json()
-    headers = dict(request.headers)
-    headers.pop("host", None)
+    body = await request.body()
+    url = _upstream_url(request)
+    headers = _forward_headers(request)
+    client = httpx.AsyncClient(timeout=TIMEOUT)
 
-    # Shorten timeouts to prevent client dropping connection during reasoning delays
-    timeout = httpx.Timeout(60.0, connect=10.0)
-    client = httpx.AsyncClient(timeout=timeout)
+    try:
+        body_json = json.loads(body) if body else {}
+    except (ValueError, TypeError):
+        body_json = {}
 
-    if body.get("stream", False):
-        req = client.build_request("POST", UPSTREAM_URL, json=body, headers=headers)
-        r = await client.send(req, stream=True)
-
-        async def stream_with_cleanup():
-            try:
-                async for chunk in transpile_stream_generator(r):
-                    yield chunk
-            finally:
-                # Release the upstream stream and the client once the response
-                # is fully consumed, cancelled, or the client disconnects
-                await r.aclose()
-                await client.aclose()
-
-        return StreamingResponse(stream_with_cleanup(), media_type="text/event-stream")
-    else:
-        # Non-streaming completions don't suffer chunk parsing errors
+    if body_json.get("stream", False):
+        req = client.build_request("POST", url, content=body, headers=headers)
         try:
-            r = await client.post(UPSTREAM_URL, json=body, headers=headers)
-            return r.json()
-        finally:
+            r = await client.send(req, stream=True)
+        except BaseException:
             await client.aclose()
+            raise
+        return _streaming_response(
+            r, client, transpile_stream_generator(r), headers=_response_headers(r)
+        )
+    else:
+        # Non-streaming completions: full passthrough of status, body, headers
+        try:
+            r = await client.post(url, content=body, headers=headers)
+        except BaseException:
+            await client.aclose()
+            raise
+        try:
+            data = await r.aread()
+            return Response(
+                content=data,
+                status_code=r.status_code,
+                headers=_response_headers(r),
+            )
+        finally:
+            await r.aclose()
+            await client.aclose()
+
+
+@app.api_route(
+    "/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+)
+async def proxy_passthrough(request: Request):
+    """Forward any other path (any method) to the upstream verbatim.
+
+    Method, path, query string, raw body bytes, and headers are all passed
+    through; hop-by-hop headers are stripped both ways. Streaming responses
+    (SSE / text/event-stream) are streamed through with cleanup.
+    """
+    body = await request.body()
+    url = _upstream_url(request)
+    headers = _forward_headers(request)
+    client = httpx.AsyncClient(timeout=TIMEOUT)
+
+    req = client.build_request(request.method, url, content=body, headers=headers)
+    try:
+        r = await client.send(req, stream=True)
+    except BaseException:
+        await client.aclose()
+        raise
+
+    content_type = r.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        return _streaming_response(r, client, r.aiter_bytes(), headers=_response_headers(r))
+
+    try:
+        data = await r.aread()
+        return Response(
+            content=data,
+            status_code=r.status_code,
+            headers=_response_headers(r),
+        )
+    finally:
+        await r.aclose()
+        await client.aclose()
